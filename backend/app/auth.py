@@ -12,7 +12,9 @@ import hashlib
 import hmac
 import secrets
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Optional
 from pydantic import BaseModel, Field
 from app.models import EmailLoginToken
@@ -24,8 +26,21 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # Separate from the IP-based rate limiter in app/rate_limit.py.
 # Keyed on normalized email to prevent one IP from spamming a single inbox
 # and to prevent a single email from being bombed from many IPs.
-_EMAIL_COOLDOWN = {}
+# Bounded the same way as rate_limit.py (#48): periodic sweep of stale
+# entries plus a hard cap with LRU eviction so attacker-chosen emails
+# cannot grow the map without bound.
+_EMAIL_COOLDOWN: OrderedDict = OrderedDict()
 _EMAIL_COOLDOWN_SECONDS = 60
+_EMAIL_COOLDOWN_LOCK = Lock()
+_EMAIL_COOLDOWN_COUNT = 0
+_EMAIL_COOLDOWN_SWEEP_INTERVAL = 100
+_EMAIL_COOLDOWN_MAX_TRACKED = 10_000
+
+
+def _sweep_email_cooldown(now: float) -> None:
+    for key, last in list(_EMAIL_COOLDOWN.items()):
+        if now - last >= _EMAIL_COOLDOWN_SECONDS:
+            del _EMAIL_COOLDOWN[key]
 
 
 def _email_cooldown_check_and_set(normalized_email: str) -> bool:
@@ -33,12 +48,31 @@ def _email_cooldown_check_and_set(normalized_email: str) -> bool:
 
     Otherwise record the request time and return False (allow).
     """
-    now = time.time()
-    last = _EMAIL_COOLDOWN.get(normalized_email)
-    if last is not None and (now - last) < _EMAIL_COOLDOWN_SECONDS:
-        return True
-    _EMAIL_COOLDOWN[normalized_email] = now
-    return False
+    global _EMAIL_COOLDOWN_COUNT
+    with _EMAIL_COOLDOWN_LOCK:
+        now = time.time()
+        _EMAIL_COOLDOWN_COUNT += 1
+        if _EMAIL_COOLDOWN_COUNT % _EMAIL_COOLDOWN_SWEEP_INTERVAL == 0:
+            _sweep_email_cooldown(now)
+
+        last = _EMAIL_COOLDOWN.get(normalized_email)
+        if last is not None and (now - last) < _EMAIL_COOLDOWN_SECONDS:
+            _EMAIL_COOLDOWN.move_to_end(normalized_email)
+            return True
+
+        if normalized_email not in _EMAIL_COOLDOWN and len(_EMAIL_COOLDOWN) >= _EMAIL_COOLDOWN_MAX_TRACKED:
+            _EMAIL_COOLDOWN.popitem(last=False)
+        _EMAIL_COOLDOWN[normalized_email] = now
+        _EMAIL_COOLDOWN.move_to_end(normalized_email)
+        return False
+
+
+def reset_email_cooldown() -> None:
+    """Clear cooldown state (tests)."""
+    global _EMAIL_COOLDOWN_COUNT
+    with _EMAIL_COOLDOWN_LOCK:
+        _EMAIL_COOLDOWN.clear()
+        _EMAIL_COOLDOWN_COUNT = 0
 
 serializer = URLSafeTimedSerializer(settings.SECRET_KEY, salt="session")
 

@@ -54,9 +54,9 @@ def fake_email(monkeypatch):
 @pytest.fixture(autouse=True)
 def reset_cooldown():
     """Clear the per-email cooldown between tests."""
-    auth_module._EMAIL_COOLDOWN.clear()
+    auth_module.reset_email_cooldown()
     yield
-    auth_module._EMAIL_COOLDOWN.clear()
+    auth_module.reset_email_cooldown()
 
 
 def _cleanup_user_by_email(email):
@@ -216,6 +216,48 @@ def test_start_cooldown_blocks_second_request_within_window(client, fake_email):
             db.close()
     finally:
         _cleanup_tokens_by_email(email)
+
+
+def test_stale_email_cooldown_entries_are_swept(monkeypatch):
+    """Stale cooldown keys are reclaimed on the periodic sweep (#106 / #48)."""
+    auth_module.reset_email_cooldown()
+    monkeypatch.setattr(auth_module, "_EMAIL_COOLDOWN_SWEEP_INTERVAL", 2)
+    now = [1000.0]
+    monkeypatch.setattr(auth_module.time, "time", lambda: now[0])
+
+    assert auth_module._email_cooldown_check_and_set("a@example.com") is False
+    assert "a@example.com" in auth_module._EMAIL_COOLDOWN
+
+    now[0] += auth_module._EMAIL_COOLDOWN_SECONDS
+    assert auth_module._email_cooldown_check_and_set("b@example.com") is False
+    assert "a@example.com" not in auth_module._EMAIL_COOLDOWN
+    assert "b@example.com" in auth_module._EMAIL_COOLDOWN
+
+
+def test_email_cooldown_cannot_grow_past_cap(monkeypatch):
+    """Many distinct emails must not leave an unbounded number of live entries."""
+    auth_module.reset_email_cooldown()
+    monkeypatch.setattr(auth_module, "_EMAIL_COOLDOWN_MAX_TRACKED", 2)
+    monkeypatch.setattr(auth_module, "_EMAIL_COOLDOWN_SWEEP_INTERVAL", 100)
+
+    for email in ("a@example.com", "b@example.com", "c@example.com"):
+        assert auth_module._email_cooldown_check_and_set(email) is False
+
+    assert len(auth_module._EMAIL_COOLDOWN) == 2
+    assert "a@example.com" not in auth_module._EMAIL_COOLDOWN
+    assert "c@example.com" in auth_module._EMAIL_COOLDOWN
+
+
+def test_email_cooldown_still_blocks_inside_window(monkeypatch):
+    """Bounding retention must not change the 60-second cooldown semantics."""
+    auth_module.reset_email_cooldown()
+    now = [1000.0]
+    monkeypatch.setattr(auth_module.time, "time", lambda: now[0])
+
+    assert auth_module._email_cooldown_check_and_set("same@example.com") is False
+    assert auth_module._email_cooldown_check_and_set("same@example.com") is True
+    now[0] += auth_module._EMAIL_COOLDOWN_SECONDS
+    assert auth_module._email_cooldown_check_and_set("same@example.com") is False
 
 
 def test_start_survives_email_send_failure(client, monkeypatch):
